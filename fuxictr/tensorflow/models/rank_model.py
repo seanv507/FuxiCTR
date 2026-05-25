@@ -71,6 +71,8 @@ class BaseModel(Model):
         self.model_dir = os.path.join(kwargs["model_root"], feature_map.dataset_id)
         self.checkpoint = os.path.abspath(os.path.join(self.model_dir, self.model_id + ".model.weights.h5"))
         self.validation_metrics = kwargs["metrics"]
+        self._wandb_run = kwargs.get("wandb_run")
+
 
     def compile(self, optimizer, loss, lr):
         """Configure the optimizer and loss function.
@@ -186,6 +188,7 @@ class BaseModel(Model):
         self._stopping_steps = 0
         self._stop_training = False
         self._total_steps = 0
+        self._total_samples = 0
         self._batch_index = 0
         self._epoch_index = 0
 
@@ -217,17 +220,36 @@ class BaseModel(Model):
         for batch_index, batch_data in enumerate(batch_iterator):
             self._batch_index = batch_index
             self._total_steps += 1
+            self._total_samples += len(batch_data)
             loss = self.train_step(batch_data)
             train_loss += loss.numpy()
             if (self._eval_steps is not None) and (self._total_steps % self._eval_steps == 0):
                 logging.info("Train loss: {:.6f}".format(train_loss / self._eval_steps))
+                val_logs = self.eval_step()
+                wandb_vals = {"train_logloss": train_loss / self._eval_steps,
+                              "epoch": self._epoch_index,
+                              "batch": self._batch_index,
+                              "total_batches": self._total_steps,
+                              "total_rows": self._total_samples,
+                }
+                for key, value in val_logs.items():
+                    wandb_vals["valid_" + key] = value
+                self._wandb_run.log(wandb_vals)
                 train_loss = 0
-                self.eval_step()
             if self._stop_training:
                 break
         if self._eval_steps is None:
             logging.info("Train loss: {:.6f}".format(train_loss / (self._batch_index + 1)))
-            self.eval_step()
+            val_logs = self.eval_step()
+            wandb_vals = {"train_logloss": train_loss / self._eval_steps,
+                            "epoch": self._epoch_index,
+                            "batch": self._batch_index,
+                            "total_batches": self._total_steps,
+                            "total_rows": self._total_samples,
+            }
+            for key, value in val_logs.items():
+                wandb_vals["valid_" + key] = value
+            self._wandb_run.log(wandb_vals)
 
     @tf.function
     def train_step(self, batch_data):
@@ -251,6 +273,7 @@ class BaseModel(Model):
         logging.info('Evaluation @epoch {} - batch {}: '.format(self._epoch_index + 1, self._batch_index + 1))
         val_logs = self.evaluate(self.valid_gen, metrics=self._monitor.get_metrics())
         self.checkpoint_and_earlystop(val_logs)
+        return val_logs
 
     def checkpoint_and_earlystop(self, logs, min_delta=1e-6):
         """Update checkpoints and determine whether to trigger early stopping.
